@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -158,20 +159,23 @@ func main() {
 }
 
 func contactHandler(w http.ResponseWriter, r *http.Request) {
-    // Allow CORS for local testing; restrict in production
-    allowedOrigin := os.Getenv("ALLOWED_ORIGIN") // e.g. https://example.com
+    // Normalize ALLOWED_ORIGIN (allow trailing slash or none) and incoming origin
+    allowedOrigin := strings.TrimRight(strings.TrimSpace(os.Getenv("ALLOWED_ORIGIN")), "/") // e.g. https://example.com
+    origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
+    referer := strings.TrimSpace(r.Referer())
     if allowedOrigin != "" {
-        origin := r.Header.Get("Origin")
-        referer := r.Referer()
-        if origin != "" && origin != allowedOrigin {
+        // If Origin header missing, try to derive origin from Referer
+        if origin == "" && referer != "" {
+            if u, err := url.Parse(referer); err == nil && u.Scheme != "" && u.Host != "" {
+                origin = u.Scheme + "://" + u.Host
+            }
+        }
+        if origin == "" || origin != allowedOrigin {
             http.Error(w, "forbidden origin", http.StatusForbidden)
             return
         }
-        if origin == "" && referer != "" && !strings.HasPrefix(referer, allowedOrigin) {
-            http.Error(w, "forbidden referer", http.StatusForbidden)
-            return
-        }
-        w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+        // Echo back the validated origin (must match request Origin)
+        w.Header().Set("Access-Control-Allow-Origin", origin)
     } else {
         // fallback to permissive for local dev
         w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -290,25 +294,20 @@ func contactHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func sendEmail(c ContactRequest) error {
-    smtpHost := os.Getenv("SMTP_HOST")
-    smtpPort := os.Getenv("SMTP_PORT")
-    smtpUser := os.Getenv("SMTP_USER")
-    smtpPass := os.Getenv("SMTP_PASS")
-    fromEnv := os.Getenv("SMTP_FROM") // optional override for From header
+    // If Mailgun API is configured, prefer it (no SMTP-port egress required)
+    mailgunURL := os.Getenv("MAILGUN_API_URL") // full API endpoint, e.g. https://api.eu.mailgun.net/v3/etheoo.com/messages
+    mailgunKey := os.Getenv("MAILGUN_API_KEY")
+    mailgunFrom := os.Getenv("MAILGUN_FROM")
     toEmail := os.Getenv("TO_EMAIL")
 
-    if smtpHost == "" || smtpPort == "" || toEmail == "" {
-        return fmt.Errorf("smtp configuration incomplete; set SMTP_HOST, SMTP_PORT and TO_EMAIL")
+    // Decide From header
+    from := mailgunFrom
+    if from == "" {
+        from = "contact-form@localhost"
     }
 
-    // Decide envelope-from and From header
-    from := fromEnv
-    if from == "" {
-        if smtpUser != "" {
-            from = smtpUser
-        } else {
-            from = "contact-form@localhost"
-        }
+    if toEmail == "" {
+        return fmt.Errorf("TO_EMAIL not set")
     }
 
     subject := c.Subject
@@ -336,6 +335,52 @@ func sendEmail(c ContactRequest) error {
     if os.Getenv("RECAPTCHA_DEBUG") != "" {
         log.Printf("recaptcha debug: token present=%v score=%.3f action=%s xff=%s remote=%s",
             c.RecaptchaScore > -1, c.RecaptchaScore, c.RecaptchaAction, c.RawXForwardedFor, c.RawRemoteAddr)
+    }
+
+    // If Mailgun API is configured, use it
+    if mailgunURL != "" && mailgunKey != "" {
+        form := url.Values{}
+        form.Set("from", from)
+        form.Set("to", toEmail)
+        form.Set("subject", subject)
+        form.Set("text", messageBody)
+
+        req, err := http.NewRequest("POST", mailgunURL, strings.NewReader(form.Encode()))
+        if err != nil {
+            return err
+        }
+        req.SetBasicAuth("api", mailgunKey)
+        req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+        client := &http.Client{Timeout: 15 * time.Second}
+        resp, err := client.Do(req)
+        if err != nil {
+            return err
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            b, _ := io.ReadAll(resp.Body)
+            return fmt.Errorf("mailgun api error: status=%d body=%s", resp.StatusCode, string(b))
+        }
+        return nil
+    }
+
+    // Fallback to SMTP (existing behavior)
+    smtpHost := os.Getenv("SMTP_HOST")
+    smtpPort := os.Getenv("SMTP_PORT")
+    smtpUser := os.Getenv("SMTP_USER")
+    smtpPass := os.Getenv("SMTP_PASS")
+    fromEnv := os.Getenv("SMTP_FROM") // optional override for From header
+
+    if smtpHost == "" || smtpPort == "" {
+        return fmt.Errorf("smtp configuration incomplete; set SMTP_HOST and SMTP_PORT")
+    }
+
+    // Decide envelope-from and From header (if SMTP fallback)
+    if fromEnv != "" {
+        from = fromEnv
+    } else if smtpUser != "" {
+        from = smtpUser
     }
 
     // Build message bytes (headers + body)
